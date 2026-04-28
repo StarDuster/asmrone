@@ -2,6 +2,7 @@ import os
 import hashlib
 import logging
 from datetime import date
+from pathlib import Path
 from threading import Lock, Thread
 from queue import Queue, Empty
 from dataclasses import dataclass
@@ -26,6 +27,7 @@ RGW_ENDPOINTS = [
 ]
 UPLOAD_CHUNK_SIZE = 16 * 1024 * 1024  # 16 MB
 RETRY_COUNT = 3
+DOWNLOAD_TMP_DIR = Path(os.environ.get("DOWNLOAD_TMP_DIR", "/data2/asmrone/tmp")).expanduser()
 
 NUM_WORKERS = 10
 NUM_LARGE_FILE_WORKERS = 4  # Number of workers dedicated to large files
@@ -230,7 +232,8 @@ def download_file_and_upload_oss(
     if _try_dedup_by_hash(file_info):
         return True
 
-    temp_filepath = f"/tmp/{uuid}"
+    DOWNLOAD_TMP_DIR.mkdir(parents=True, exist_ok=True)
+    temp_filepath = DOWNLOAD_TMP_DIR / uuid
 
     for attempt in range(RETRY_COUNT):
         try:
@@ -271,7 +274,7 @@ def download_file_and_upload_oss(
                         error_message = "File size mismatch."
                         continue
 
-                    if not upload_to_bucket(temp_filepath, str(uuid), expected_size):
+                    if not upload_to_bucket(str(temp_filepath), str(uuid), expected_size):
                         error_message = "Failed to upload to OSS."
                         continue
 
@@ -287,9 +290,9 @@ def download_file_and_upload_oss(
             error_message = str(e)
 
         finally:
-            if os.path.exists(temp_filepath):
+            if temp_filepath.exists():
                 try:
-                    os.remove(temp_filepath)
+                    temp_filepath.unlink()
                 except:
                     pass
 

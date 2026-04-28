@@ -2,14 +2,22 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from datetime import datetime
+from pathlib import Path
+
+
+def _default_sqlite_path():
+    data_home = Path(os.environ.get("XDG_DATA_HOME", "~/.local/share")).expanduser()
+    return data_home / "asmrone" / "asmrone.db"
 
 
 def sqlite_path():
-    return os.environ.get("SQLITE_PATH", "asmrone.db")
+    return Path(os.environ.get("SQLITE_PATH", _default_sqlite_path())).expanduser()
 
 
 def connect():
-    connection = sqlite3.connect(sqlite_path(), timeout=30)
+    path = sqlite_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path, timeout=30)
     connection.execute("PRAGMA journal_mode=WAL")
     connection.execute("PRAGMA foreign_keys=ON")
     return connection

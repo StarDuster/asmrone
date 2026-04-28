@@ -15,7 +15,18 @@ class VoiceFilesSpider(scrapy.Spider):
         self.crawl_uuid = crawl_uuid
         self.work_ids = self._normalize_work_ids(work_ids)
 
-        domains = self.settings.getlist("API_DOMAINS", ["api.asmr-200.com"])
+        domains = ["api.asmr-200.com"]
+        self.allowed_domains = [*domains, "kiko-play-niptan.one"]
+        self._domain_cycle = cycle(domains)
+
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        spider = super().from_crawler(crawler, *args, **kwargs)
+        spider._configure_domains(crawler.settings)
+        return spider
+
+    def _configure_domains(self, settings):
+        domains = settings.getlist("API_DOMAINS", ["api.asmr-200.com"])
         self.allowed_domains = [*domains, "kiko-play-niptan.one"]
         self._domain_cycle = cycle(domains)
 
@@ -30,7 +41,7 @@ class VoiceFilesSpider(scrapy.Spider):
         domain = next(self._domain_cycle)
         return f"https://{domain}{path}"
 
-    def start_requests(self):
+    async def start(self):
         for work_id in self.work_ids:
             yield scrapy.Request(
                 url=self._api_url(f"/api/tracks/{work_id}"),

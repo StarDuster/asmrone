@@ -20,13 +20,24 @@ class VoiceWorksSpider(scrapy.Spider):
         self.work_ids = []
         type(self).latest_work_ids = self.work_ids
 
-        domains = self.settings.getlist("API_DOMAINS", ["api.asmr-200.com"])
+        domains = ["api.asmr-200.com"]
         self.allowed_domains = [*domains, "kiko-play-niptan.one"]
         self._domain_cycle = cycle(domains)
 
         self._checkpoint = None
         if not self.full_mode:
             self._checkpoint = get_crawl_state("max_create_date")
+
+    @classmethod
+    def from_crawler(cls, crawler, *args, **kwargs):
+        spider = super().from_crawler(crawler, *args, **kwargs)
+        spider._configure_domains(crawler.settings)
+        return spider
+
+    def _configure_domains(self, settings):
+        domains = settings.getlist("API_DOMAINS", ["api.asmr-200.com"])
+        self.allowed_domains = [*domains, "kiko-play-niptan.one"]
+        self._domain_cycle = cycle(domains)
 
     def _api_url(self, path):
         domain = next(self._domain_cycle)
@@ -38,7 +49,7 @@ class VoiceWorksSpider(scrapy.Spider):
             self.work_ids.append(work_id)
         return {"crawl_uuid": str(self.crawl_uuid), **work}
 
-    def start_requests(self):
+    async def start(self):
         yield scrapy.Request(
             url=self._api_url(f"/api/works?order=create_date&sort=desc&page=1&pageSize={PAGE_SIZE}"),
             callback=self.parse,

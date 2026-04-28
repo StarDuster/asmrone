@@ -26,14 +26,14 @@ DEDUP_EXTENSIONS = {
 
 
 class VoiceFilesDBPipeline:
-    def open_spider(self, spider):
+    def open_spider(self, spider=None):
         self.connection = connect()
         init_db(self.connection)
 
-    def close_spider(self, spider):
+    def close_spider(self, spider=None):
         self.connection.close()
 
-    def process_item(self, item, spider):
+    def process_item(self, item, spider=None):
         voice_file = item
         create_pg_record = False
 
@@ -87,6 +87,9 @@ class VoiceFilesDBPipeline:
 
         except Exception as e:
             self.connection.rollback()
-            spider.logger.error(f"Error processing item: {e}")
+            if spider:
+                spider.logger.error(f"Error processing item: {e}")
+            else:
+                raise
 
         return item

@@ -28,7 +28,9 @@ OSS_BUCKET_NAME = os.environ.get("OSS_BUCKET_NAME", "sd-tokyo-ap")
 OSS_PREFIX = os.environ.get("OSS_PREFIX", "datasets/speech_datasets/asmr").strip("/")
 UPLOAD_CHUNK_SIZE = 16 * 1024 * 1024  # 16 MB
 RETRY_COUNT = 3
-DOWNLOAD_TMP_DIR = Path(os.environ.get("DOWNLOAD_TMP_DIR", "/data2/asmrone/tmp")).expanduser()
+DOWNLOAD_TMP_DIR = Path(
+    os.environ.get("DOWNLOAD_TMP_DIR", "/data/asmrone/tmp")
+).expanduser()
 
 NUM_WORKERS = 10
 NUM_LARGE_FILE_WORKERS = 4  # Number of workers dedicated to large files

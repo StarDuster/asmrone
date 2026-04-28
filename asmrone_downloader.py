@@ -2,19 +2,17 @@ import os
 import hashlib
 import logging
 from datetime import date
-from concurrent.futures import ThreadPoolExecutor
 from threading import Lock, Thread
 from queue import Queue, Empty
 from dataclasses import dataclass
 from typing import List, Tuple, Optional
 
-import psycopg
 import requests
 import boto3
 from tqdm import tqdm
 from requests_toolbelt.adapters.host_header_ssl import HostHeaderSSLAdapter
 from boto3.s3.transfer import TransferConfig
-from urllib.parse import urlparse
+from asmrone_crawler.storage import database
 
 # Configuration
 OSS_ACCESS_KEY = ""
@@ -26,16 +24,7 @@ RGW_ENDPOINTS = [
     "http://192.168.0.12:7480",
     "http://192.168.0.13:7480",
 ]
-POSTGRES_USER = os.environ.get("POSTGRES_USER", "asmrone_crawler")
-POSTGRES_PASSWORD = os.environ.get(
-    "POSTGRES_PASS", ""
-)
-POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "192.168.1.1")
-POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "12345")
-POSTGRES_DB = os.environ.get("POSTGRES_DB", "asmrone_crawler")
 UPLOAD_CHUNK_SIZE = 16 * 1024 * 1024  # 16 MB
-CHUNK_SIZE = 100000000
-# CHUNK_SIZE = 33554432
 RETRY_COUNT = 3
 
 NUM_WORKERS = 10
@@ -168,44 +157,6 @@ def get_s3_client():
 get_s3_client.endpoint_index = 0
 
 
-def calculate_s3_etag(file_path):
-    md5s = []
-
-    with open(file_path, "rb") as fp:
-        while True:
-            data = fp.read(CHUNK_SIZE)
-            if not data:
-                break
-            md5s.append(hashlib.md5(data))
-
-    if len(md5s) < 1:
-        return "{}".format(hashlib.md5().hexdigest())
-
-    if len(md5s) == 1:
-        return "{}".format(md5s[0].hexdigest())
-
-    digests = b"".join(m.digest() for m in md5s)
-    digests_md5 = hashlib.md5(digests)
-    return "{}-{}".format(digests_md5.hexdigest(), len(md5s))
-
-
-def is_valid_md5(md5_str):
-    parts = md5_str.split("-")
-
-    if len(parts) == 1:
-        return len(md5_str) == 32 and all(c in "0123456789abcdef" for c in md5_str)
-
-    elif len(parts) == 2:
-        md5_part, num_parts_str = parts
-        return (
-            len(md5_part) == 32
-            and all(c in "0123456789abcdef" for c in md5_part)
-            and num_parts_str.isdigit()
-        )
-
-    return False
-
-
 def upload_to_bucket(file_path, object_name, expected_size):
     try:
         s3_client = get_s3_client()
@@ -231,28 +182,61 @@ def upload_to_bucket(file_path, object_name, expected_size):
         return False
 
 
+def _try_dedup_by_hash(file_info: FileInfo):
+    """下载前用 tracks hash + size 查找已下载的相同文件，命中则 S3 copy 跳过下载。"""
+    hash_val = file_info.cloudflare_etag
+    if not hash_val:
+        return False
+    try:
+        with database() as conn:
+            cur = conn.execute(
+                """
+                SELECT uuid FROM t_file
+                WHERE cloudflare_etag = ?
+                    AND size = ?
+                    AND download_date IS NOT NULL
+                    AND uuid != ?
+                LIMIT 1
+                """,
+                (hash_val, file_info.size, file_info.uuid),
+            )
+            dup = cur.fetchone()
+            if not dup:
+                return False
+            s3_client = get_s3_client()
+            s3_client.copy(
+                Bucket=OSS_BUCKET_NAME,
+                CopySource={"Bucket": OSS_BUCKET_NAME, "Key": f"asmrone/{dup[0]}"},
+                Key=f"asmrone/{file_info.uuid}",
+            )
+            conn.execute(
+                "UPDATE t_file SET download_date = ? WHERE uuid = ?",
+                (date.today().isoformat(), file_info.uuid),
+            )
+            return True
+    except Exception as e:
+        logging.error(f"Pre-download dedup failed for {file_info.uuid}: {e}")
+        return False
+
+
 def download_file_and_upload_oss(
     file_info: FileInfo, worker_id: int
 ):
     uuid = file_info.uuid
-    work_id = file_info.work_id
     file_path = file_info.file_path
     url = file_info.download_url
-    expected_etag = file_info.cloudflare_etag
     expected_size = file_info.size
 
-    original_host = urlparse(url).hostname
+    if _try_dedup_by_hash(file_info):
+        return True
+
     temp_filepath = f"/tmp/{uuid}"
 
     for attempt in range(RETRY_COUNT):
         try:
-
             with open(temp_filepath, "wb") as temp_file:
-                response = session.get(
-                    url, stream=True, timeout=30
-                )
+                response = session.get(url, stream=True, timeout=30)
                 response.raise_for_status()
-
                 for chunk in response.iter_content(chunk_size=8192):
                     temp_file.write(chunk)
 
@@ -260,37 +244,41 @@ def download_file_and_upload_oss(
                 file_md5 = hashlib.md5(f.read()).hexdigest()
             file_size = os.path.getsize(temp_filepath)
 
-            with psycopg.connect(
-                f"dbname={POSTGRES_DB} user={POSTGRES_USER} password={POSTGRES_PASSWORD} host={POSTGRES_HOST} port={POSTGRES_PORT}"
-            ) as connection:
-                with connection.cursor() as cursor:
-                    cursor.execute(
-                        "SELECT uuid, md5 FROM t_file WHERE md5 = %s AND uuid != %s AND download_date IS NOT NULL",
-                        (file_md5, uuid),
+            with database() as connection:
+                cursor = connection.execute(
+                    """
+                    SELECT uuid, md5 FROM t_file
+                    WHERE md5 = ?
+                        AND uuid != ?
+                        AND download_date IS NOT NULL
+                    """,
+                    (file_md5, uuid),
+                )
+                results = cursor.fetchall()
+
+                if len(results) > 0:
+                    s3_client = get_s3_client()
+                    s3_client.copy(
+                        Bucket=OSS_BUCKET_NAME,
+                        CopySource={
+                            "Bucket": OSS_BUCKET_NAME,
+                            "Key": f"asmrone/{results[0][0]}",
+                        },
+                        Key=f"asmrone/{uuid}",
                     )
-                    results = cursor.fetchall()
+                else:
+                    if not file_path.lower().endswith(".txt") and file_size != expected_size:
+                        error_message = "File size mismatch."
+                        continue
 
-                    if (len(results) > 0):
-                        s3_client = get_s3_client()
-                        s3_client.copy(
-                            Bucket=OSS_BUCKET_NAME,
-                            CopySource={'Bucket': f"{OSS_BUCKET_NAME}",
-                                        'Key': f"asmrone/{results[0][0]}"},
-                            Key=f"asmrone/{uuid}",
-                        )
-                    else:
-                        if not file_path.lower().endswith(".txt") and file_size != expected_size:
-                            error_message = "File size mismatch."
-                            continue
+                    if not upload_to_bucket(temp_filepath, str(uuid), expected_size):
+                        error_message = "Failed to upload to OSS."
+                        continue
 
-                        if not upload_to_bucket(temp_filepath, str(uuid), expected_size):
-                            error_message = "Failed to upload to OSS."
-                            continue
-
-                    cursor.execute(
-                        "UPDATE t_file SET md5 = %s, download_date = %s, size = %s WHERE uuid = %s",
-                        (file_md5, date.today(), file_size, uuid),
-                    )
+                connection.execute(
+                    "UPDATE t_file SET md5 = ?, download_date = ?, size = ? WHERE uuid = ?",
+                    (file_md5, date.today().isoformat(), file_size, uuid),
+                )
 
             os.remove(temp_filepath)
             return True
@@ -332,21 +320,13 @@ def worker_thread(worker_id, queue_manager, pbar):
 
 
 def main():
-    with psycopg.connect(
-        f"dbname={POSTGRES_DB} user={POSTGRES_USER} password={POSTGRES_PASSWORD} host={POSTGRES_HOST} port={POSTGRES_PORT}"
-    ) as connection:
-        with connection.cursor() as cursor:
-            cursor.execute("""
-                SELECT uuid, work_id, path, download_url, cloudflare_etag, size
-                FROM (
-                    SELECT uuid, work_id, path, download_url, cloudflare_etag, size,
-                           ROW_NUMBER() OVER (PARTITION BY uuid ORDER BY download_date DESC NULLS LAST) AS rn
-                    FROM t_file
-                    WHERE masked = FALSE AND download_date IS NULL
-                ) t
-                WHERE rn = 1;
-            """)
-            file_info_list = cursor.fetchall()
+    with database() as connection:
+        cursor = connection.execute("""
+            SELECT uuid, work_id, path, download_url, cloudflare_etag, size
+            FROM t_file
+            WHERE masked = 0 AND download_date IS NULL;
+        """)
+        file_info_list = cursor.fetchall()
 
     if len(file_info_list) == 0:
         print("All files are up to date.")

@@ -5,8 +5,6 @@ description = "ASMR One crawler and downloader"
 requires-python = ">=3.11"
 dependencies = [
     "boto3",
-    "psycopg[binary]",
-    "pymongo",
     "requests",
     "requests-toolbelt",
     "scrapy",

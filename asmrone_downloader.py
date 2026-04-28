@@ -1,6 +1,9 @@
 import os
 import hashlib
 import logging
+import configparser
+import shutil
+import subprocess
 from datetime import date
 from pathlib import Path
 from threading import Lock, Thread
@@ -13,18 +16,16 @@ import boto3
 from tqdm import tqdm
 from requests_toolbelt.adapters.host_header_ssl import HostHeaderSSLAdapter
 from boto3.s3.transfer import TransferConfig
+from botocore.config import Config
 from asmrone_crawler.storage import database
 
 # Configuration
-OSS_ACCESS_KEY = ""
-OSS_SECRET_KEY = ""
-OSS_BUCKET_NAME = "voices"
-OSS_ENDPOINT_URL = ""
-RGW_ENDPOINTS = [
-    "http://192.168.0.11:7480",
-    "http://192.168.0.12:7480",
-    "http://192.168.0.13:7480",
-]
+RCLONE_CONFIG_PATH = Path(
+    os.environ.get("RCLONE_CONFIG", "~/.config/rclone/rclone.conf")
+).expanduser()
+RCLONE_REMOTE_NAME = os.environ.get("RCLONE_REMOTE_NAME", "alioss")
+OSS_BUCKET_NAME = os.environ.get("OSS_BUCKET_NAME", "sd-tokyo-ap")
+OSS_PREFIX = os.environ.get("OSS_PREFIX", "datasets/speech_datasets/asmr").strip("/")
 UPLOAD_CHUNK_SIZE = 16 * 1024 * 1024  # 16 MB
 RETRY_COUNT = 3
 DOWNLOAD_TMP_DIR = Path(os.environ.get("DOWNLOAD_TMP_DIR", "/data2/asmrone/tmp")).expanduser()
@@ -48,22 +49,6 @@ transfer_config = TransferConfig(
     io_chunksize=262144,
     use_threads=True,
 )
-host_map = {
-    "large.kiko-play-niptan.one": [
-        "162.159.133.151",
-        "104.19.167.40",
-        "104.16.168.105",
-        "104.17.221.182",
-        "104.19.214.20",
-    ],
-    "raw.kiko-play-niptan.one": [
-        "104.19.215.92",
-        "198.41.195.70",
-        "104.18.20.190",
-        "104.19.238.35",
-        "198.41.200.24",
-    ],
-}
 session = requests.Session()
 adapter = HostHeaderSSLAdapter()
 session.mount("https://", adapter)
@@ -79,26 +64,11 @@ class FileInfo:
     size: int
 
 
-class HostSelector:
-    def __init__(self, host_map):
-        self.host_map = host_map
-        self.lock = Lock()
-        self.assigned_ips = {}
-
-    def assign_ip_to_worker(self, host, worker_id):
-        with self.lock:
-            if host in self.host_map:
-                ip_list = self.host_map[host]
-                # Assign an IP to a worker based on the worker_id
-                assigned_ip = ip_list[worker_id % len(ip_list)]
-                if worker_id not in self.assigned_ips:
-                    self.assigned_ips[worker_id] = {}
-                self.assigned_ips[worker_id][host] = assigned_ip
-
-    def get_ip_for_worker(self, host, worker_id):
-        if worker_id in self.assigned_ips and host in self.assigned_ips[worker_id]:
-            return self.assigned_ips[worker_id][host]
-        return None
+@dataclass(frozen=True)
+class OssConfig:
+    access_key_id: str
+    secret_access_key: str
+    endpoint_url: str
 
 
 class DownloadQueueManager:
@@ -140,47 +110,137 @@ class DownloadQueueManager:
         return self.small_files_queue.empty() and self.large_files_queue.empty()
 
 
-host_selector = HostSelector(host_map)
+_oss_config = None
+_oss_config_lock = Lock()
+
+
+def _endpoint_url(endpoint: str) -> str:
+    if endpoint.startswith(("http://", "https://")):
+        return endpoint
+    return f"https://{endpoint}"
+
+
+def _load_oss_config() -> OssConfig:
+    parser = configparser.ConfigParser()
+    if not parser.read(RCLONE_CONFIG_PATH):
+        raise FileNotFoundError(f"rclone config not found: {RCLONE_CONFIG_PATH}")
+    if RCLONE_REMOTE_NAME not in parser:
+        raise ValueError(f"rclone remote not found: {RCLONE_REMOTE_NAME}")
+
+    remote = parser[RCLONE_REMOTE_NAME]
+    missing = [
+        key
+        for key in ("access_key_id", "secret_access_key", "endpoint")
+        if not remote.get(key)
+    ]
+    if missing:
+        raise ValueError(
+            f"rclone remote {RCLONE_REMOTE_NAME} missing keys: {', '.join(missing)}"
+        )
+
+    return OssConfig(
+        access_key_id=remote["access_key_id"],
+        secret_access_key=remote["secret_access_key"],
+        endpoint_url=_endpoint_url(remote["endpoint"]),
+    )
+
+
+def get_oss_config() -> OssConfig:
+    global _oss_config
+    if _oss_config is None:
+        with _oss_config_lock:
+            if _oss_config is None:
+                _oss_config = _load_oss_config()
+    return _oss_config
 
 
 def get_s3_client():
-    endpoint_url = RGW_ENDPOINTS[get_s3_client.endpoint_index]
-    get_s3_client.endpoint_index = (get_s3_client.endpoint_index + 1) % len(
-        RGW_ENDPOINTS
-    )
+    oss_config = get_oss_config()
     return boto3.client(
         "s3",
-        endpoint_url=endpoint_url,
-        aws_access_key_id=OSS_ACCESS_KEY,
-        aws_secret_access_key=OSS_SECRET_KEY,
+        endpoint_url=oss_config.endpoint_url,
+        aws_access_key_id=oss_config.access_key_id,
+        aws_secret_access_key=oss_config.secret_access_key,
+        config=Config(
+            signature_version="s3v4",
+            s3={"addressing_style": "virtual"},
+        ),
     )
 
 
-get_s3_client.endpoint_index = 0
+def _is_wav_file(file_path: str) -> bool:
+    return Path(file_path).suffix.lower() == ".wav"
 
 
-def upload_to_bucket(file_path, object_name, expected_size):
+def _object_key(file_uuid: str, file_path: str) -> str:
+    object_name = f"{file_uuid}.flac" if _is_wav_file(file_path) else file_uuid
+    return f"{OSS_PREFIX}/{object_name}" if OSS_PREFIX else object_name
+
+
+def _convert_wav_to_flac(input_path: Path) -> Path:
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        raise RuntimeError("ffmpeg is required to convert WAV files to FLAC")
+
+    output_path = input_path.with_suffix(".flac")
+    subprocess.run(
+        [
+            ffmpeg,
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            str(input_path),
+            "-vn",
+            "-compression_level",
+            "8",
+            str(output_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return output_path
+
+
+def upload_to_bucket(file_path, object_key, expected_size):
     try:
         s3_client = get_s3_client()
-        object_name = f"asmrone/{object_name}"
         s3_client.upload_file(
-            file_path, OSS_BUCKET_NAME, object_name, Config=transfer_config
+            file_path, OSS_BUCKET_NAME, object_key, Config=transfer_config
         )
 
-        response = s3_client.head_object(
-            Bucket=OSS_BUCKET_NAME, Key=object_name)
+        response = s3_client.head_object(Bucket=OSS_BUCKET_NAME, Key=object_key)
         uploaded_size = response["ContentLength"]
 
         if expected_size == 0 or uploaded_size == expected_size:
             return True
         else:
-            s3_client.delete_object(Bucket=OSS_BUCKET_NAME, Key=object_name)
+            s3_client.delete_object(Bucket=OSS_BUCKET_NAME, Key=object_key)
             error_message = "File size mismatch when uploading to OSS."
-            logging.error(f"{object_name}: {error_message}\n")
+            logging.error(f"{object_key}: {error_message}\n")
             return False
     except Exception as e:
         error_message = "Failed to upload to OSS. " + str(e)
-        logging.error(f"{object_name}: {error_message}\n")
+        logging.error(f"{object_key}: {error_message}\n")
+        return False
+
+
+def copy_existing_object(source_uuid, source_path, target_uuid, target_path):
+    try:
+        s3_client = get_s3_client()
+        s3_client.copy(
+            Bucket=OSS_BUCKET_NAME,
+            CopySource={
+                "Bucket": OSS_BUCKET_NAME,
+                "Key": _object_key(source_uuid, source_path),
+            },
+            Key=_object_key(target_uuid, target_path),
+        )
+        return True
+    except Exception as e:
+        logging.error(f"Failed to copy existing OSS object for {target_uuid}: {e}")
         return False
 
 
@@ -193,7 +253,7 @@ def _try_dedup_by_hash(file_info: FileInfo):
         with database() as conn:
             cur = conn.execute(
                 """
-                SELECT uuid FROM t_file
+                SELECT uuid, path FROM t_file
                 WHERE cloudflare_etag = ?
                     AND size = ?
                     AND download_date IS NOT NULL
@@ -205,12 +265,10 @@ def _try_dedup_by_hash(file_info: FileInfo):
             dup = cur.fetchone()
             if not dup:
                 return False
-            s3_client = get_s3_client()
-            s3_client.copy(
-                Bucket=OSS_BUCKET_NAME,
-                CopySource={"Bucket": OSS_BUCKET_NAME, "Key": f"asmrone/{dup[0]}"},
-                Key=f"asmrone/{file_info.uuid}",
-            )
+            if not copy_existing_object(
+                dup[0], dup[1], file_info.uuid, file_info.file_path
+            ):
+                return False
             conn.execute(
                 "UPDATE t_file SET download_date = ? WHERE uuid = ?",
                 (date.today().isoformat(), file_info.uuid),
@@ -221,9 +279,7 @@ def _try_dedup_by_hash(file_info: FileInfo):
         return False
 
 
-def download_file_and_upload_oss(
-    file_info: FileInfo, worker_id: int
-):
+def download_file_and_upload_oss(file_info: FileInfo):
     uuid = file_info.uuid
     file_path = file_info.file_path
     url = file_info.download_url
@@ -236,6 +292,7 @@ def download_file_and_upload_oss(
     temp_filepath = DOWNLOAD_TMP_DIR / uuid
 
     for attempt in range(RETRY_COUNT):
+        converted_filepath = None
         try:
             with open(temp_filepath, "wb") as temp_file:
                 response = session.get(url, stream=True, timeout=30)
@@ -250,31 +307,39 @@ def download_file_and_upload_oss(
             with database() as connection:
                 cursor = connection.execute(
                     """
-                    SELECT uuid, md5 FROM t_file
+                    SELECT uuid, path FROM t_file
                     WHERE md5 = ?
                         AND uuid != ?
                         AND download_date IS NOT NULL
+                    LIMIT 1
                     """,
                     (file_md5, uuid),
                 )
                 results = cursor.fetchall()
 
-                if len(results) > 0:
-                    s3_client = get_s3_client()
-                    s3_client.copy(
-                        Bucket=OSS_BUCKET_NAME,
-                        CopySource={
-                            "Bucket": OSS_BUCKET_NAME,
-                            "Key": f"asmrone/{results[0][0]}",
-                        },
-                        Key=f"asmrone/{uuid}",
-                    )
+                if len(results) > 0 and copy_existing_object(
+                    results[0][0], results[0][1], uuid, file_path
+                ):
+                    pass
                 else:
-                    if not file_path.lower().endswith(".txt") and file_size != expected_size:
+                    if (
+                        not file_path.lower().endswith(".txt")
+                        and file_size != expected_size
+                    ):
                         error_message = "File size mismatch."
                         continue
 
-                    if not upload_to_bucket(str(temp_filepath), str(uuid), expected_size):
+                    upload_path = temp_filepath
+                    if _is_wav_file(file_path):
+                        converted_filepath = _convert_wav_to_flac(temp_filepath)
+                        upload_path = converted_filepath
+
+                    upload_size = os.path.getsize(upload_path)
+                    if not upload_to_bucket(
+                        str(upload_path),
+                        _object_key(uuid, file_path),
+                        upload_size,
+                    ):
                         error_message = "Failed to upload to OSS."
                         continue
 
@@ -295,6 +360,11 @@ def download_file_and_upload_oss(
                     temp_filepath.unlink()
                 except:
                     pass
+            if converted_filepath and converted_filepath.exists():
+                try:
+                    converted_filepath.unlink()
+                except:
+                    pass
 
     logging.error(f"All retries failed for {url}: {error_message}\n")
     return False
@@ -311,7 +381,7 @@ def worker_thread(worker_id, queue_manager, pbar):
                 break
 
             # Process the file
-            if download_file_and_upload_oss(file_info, worker_id):
+            if download_file_and_upload_oss(file_info):
                 with pbar.get_lock():
                     pbar.update(file_info.size)
 

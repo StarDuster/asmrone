@@ -2,6 +2,7 @@ FROM python:3.11-slim
 
 RUN DEBIAN_FRONTEND=noninteractive apt-get update && apt-get install -y \
     ca-certificates \
+    ffmpeg \
     procps \
     && rm -rf /var/lib/apt/lists/*
 

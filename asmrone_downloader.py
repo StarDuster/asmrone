@@ -5,7 +5,7 @@ import configparser
 import shutil
 import subprocess
 from datetime import date
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import Lock, Thread
 from queue import Queue, Empty
 from dataclasses import dataclass
@@ -179,8 +179,20 @@ def _is_wav_file(file_path: str) -> bool:
     return Path(file_path).suffix.lower() == ".wav"
 
 
-def _object_key(file_uuid: str, file_path: str) -> str:
-    object_name = f"{file_uuid}.flac" if _is_wav_file(file_path) else file_uuid
+def _safe_object_path(file_path: str) -> str:
+    path = PurePosixPath(file_path.replace("\\", "/"))
+    parts = [part for part in path.parts if part not in ("", ".", "..")]
+    if not parts:
+        return "file"
+    return str(PurePosixPath(*parts))
+
+
+def _object_key(work_id: str, file_path: str) -> str:
+    object_path = _safe_object_path(file_path)
+    if _is_wav_file(object_path):
+        object_path = str(PurePosixPath(object_path).with_suffix(".flac"))
+
+    object_name = str(PurePosixPath(str(work_id), object_path))
     return f"{OSS_PREFIX}/{object_name}" if OSS_PREFIX else object_name
 
 
@@ -234,20 +246,20 @@ def upload_to_bucket(file_path, object_key, expected_size):
         return False
 
 
-def copy_existing_object(source_uuid, source_path, target_uuid, target_path):
+def copy_existing_object(source_work_id, source_path, target_work_id, target_path):
     try:
         s3_client = get_s3_client()
         s3_client.copy(
             Bucket=OSS_BUCKET_NAME,
             CopySource={
                 "Bucket": OSS_BUCKET_NAME,
-                "Key": _object_key(source_uuid, source_path),
+                "Key": _object_key(source_work_id, source_path),
             },
-            Key=_object_key(target_uuid, target_path),
+            Key=_object_key(target_work_id, target_path),
         )
         return True
     except Exception as e:
-        logging.error(f"Failed to copy existing OSS object for {target_uuid}: {e}")
+        logging.error(f"Failed to copy existing OSS object for {target_work_id}: {e}")
         return False
 
 
@@ -260,7 +272,7 @@ def _try_dedup_by_hash(file_info: FileInfo):
         with database() as conn:
             cur = conn.execute(
                 """
-                SELECT uuid, path FROM t_file
+                SELECT work_id, path FROM t_file
                 WHERE cloudflare_etag = ?
                     AND size = ?
                     AND download_date IS NOT NULL
@@ -273,7 +285,7 @@ def _try_dedup_by_hash(file_info: FileInfo):
             if not dup:
                 return False
             if not copy_existing_object(
-                dup[0], dup[1], file_info.uuid, file_info.file_path
+                dup[0], dup[1], file_info.work_id, file_info.file_path
             ):
                 return False
             conn.execute(
@@ -314,7 +326,7 @@ def download_file_and_upload_oss(file_info: FileInfo):
             with database() as connection:
                 cursor = connection.execute(
                     """
-                    SELECT uuid, path FROM t_file
+                    SELECT work_id, path FROM t_file
                     WHERE md5 = ?
                         AND uuid != ?
                         AND download_date IS NOT NULL
@@ -325,7 +337,7 @@ def download_file_and_upload_oss(file_info: FileInfo):
                 results = cursor.fetchall()
 
                 if len(results) > 0 and copy_existing_object(
-                    results[0][0], results[0][1], uuid, file_path
+                    results[0][0], results[0][1], file_info.work_id, file_path
                 ):
                     pass
                 else:
@@ -344,7 +356,7 @@ def download_file_and_upload_oss(file_info: FileInfo):
                     upload_size = os.path.getsize(upload_path)
                     if not upload_to_bucket(
                         str(upload_path),
-                        _object_key(uuid, file_path),
+                        _object_key(file_info.work_id, file_path),
                         upload_size,
                     ):
                         error_message = "Failed to upload to OSS."

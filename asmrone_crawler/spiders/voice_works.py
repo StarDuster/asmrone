@@ -9,6 +9,9 @@ PAGE_SIZE = 500
 
 class VoiceWorksSpider(scrapy.Spider):
     name = "voice_works"
+    custom_settings = {
+        "ITEM_PIPELINES": {"asmrone_crawler.pipelines.WorkMetadataPipeline": 300},
+    }
     latest_work_ids = []
     install_reactor("twisted.internet.asyncioreactor.AsyncioSelectorReactor")
 

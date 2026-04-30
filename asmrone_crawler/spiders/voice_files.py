@@ -55,6 +55,13 @@ class VoiceFilesSpider(scrapy.Spider):
         item["download_url"] = track_item["mediaDownloadUrl"]
         item["hash"] = track_item["hash"]
         item["size"] = track_item["size"]
+        item["file_type"] = track_item.get("type")
+        item["title"] = track_item.get("title")
+        item["duration"] = track_item.get("duration")
+        item["media_stream_url"] = track_item.get("mediaStreamUrl")
+        item["stream_low_quality_url"] = track_item.get("streamLowQualityUrl")
+        item["work_title"] = track_item.get("workTitle")
+        item["raw_json"] = track_item
         return item
 
     def process_folder(self, folder, work_id, folder_path=""):

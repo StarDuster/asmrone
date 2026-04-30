@@ -2,6 +2,7 @@ import os
 import hashlib
 import logging
 import configparser
+import re
 import shutil
 import subprocess
 from datetime import date
@@ -35,6 +36,14 @@ DOWNLOAD_TMP_DIR = Path(
 NUM_WORKERS = 10
 NUM_LARGE_FILE_WORKERS = 4  # Number of workers dedicated to large files
 LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100 MB threshold for large files
+NO_EFFECT_RE = re.compile(
+    r"(効果音\s*(?:なし|無し|ナシ|無|抜き)|SE\s*(?:カット|Cut|無し|なし)|効果音カット)",
+    re.IGNORECASE,
+)
+WITH_EFFECT_RE = re.compile(
+    r"(効果音\s*(?:あり|有り|アリ|入り|入|大|小)|SE\s*(?:あり|有り|入り))",
+    re.IGNORECASE,
+)
 
 logging.basicConfig(
     filename="error.log",
@@ -111,6 +120,44 @@ class DownloadQueueManager:
     def is_empty(self) -> bool:
         """Check if both queues are empty"""
         return self.small_files_queue.empty() and self.large_files_queue.empty()
+
+
+def _sound_effect_variant(file_path: str) -> str:
+    no_effect = bool(NO_EFFECT_RE.search(file_path or ""))
+    with_effect = bool(WITH_EFFECT_RE.search(file_path or ""))
+    if no_effect and not with_effect:
+        return "no_effect"
+    if with_effect and not no_effect:
+        return "with_effect"
+    if no_effect and with_effect:
+        return "no_effect"
+    return "unmarked"
+
+
+def _filter_sound_effect_variants(file_info_list: List[Tuple]):
+    variants_by_source = {}
+    for file_info in file_info_list:
+        source_id = file_info[2]
+        variant = _sound_effect_variant(file_info[3])
+        variants = variants_by_source.setdefault(
+            source_id,
+            {"no_effect": False, "with_effect": False},
+        )
+        if variant == "no_effect":
+            variants["no_effect"] = True
+        elif variant == "with_effect":
+            variants["with_effect"] = True
+
+    selected = []
+    skipped = []
+    for file_info in file_info_list:
+        variants = variants_by_source[file_info[2]]
+        variant = _sound_effect_variant(file_info[3])
+        if variants["no_effect"] and variants["with_effect"] and variant == "with_effect":
+            skipped.append(file_info)
+        else:
+            selected.append(file_info)
+    return selected, skipped
 
 
 _oss_config = None
@@ -431,11 +478,21 @@ def main():
             LEFT JOIN t_work w ON w.work_id = f.work_id
             WHERE f.masked = 0 AND f.download_date IS NULL;
         """)
-        file_info_list = cursor.fetchall()
+        file_info_list, skipped_effect_files = _filter_sound_effect_variants(
+            cursor.fetchall()
+        )
 
     if len(file_info_list) == 0:
         print("All files are up to date.")
         return
+
+    if skipped_effect_files:
+        skipped_size = sum(file_info[6] for file_info in skipped_effect_files)
+        print(
+            "Skipped sound-effect variants: "
+            f"{len(skipped_effect_files)} files "
+            f"({skipped_size / 1024**4:.2f} TiB)"
+        )
 
     # Create queue manager
     queue_manager = DownloadQueueManager(file_info_list)

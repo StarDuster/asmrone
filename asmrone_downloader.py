@@ -165,7 +165,12 @@ def get_s3_client():
         aws_secret_access_key=oss_config.secret_access_key,
         config=Config(
             signature_version="s3v4",
-            s3={"addressing_style": "virtual"},
+            request_checksum_calculation="when_required",
+            response_checksum_validation="when_required",
+            s3={
+                "addressing_style": "virtual",
+                "payload_signing_enabled": False,
+            },
         ),
     )
 

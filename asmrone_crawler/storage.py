@@ -61,6 +61,7 @@ def init_db(connection):
     )
     _ensure_column(connection, "t_file", "work_title", "work_title TEXT")
     _ensure_column(connection, "t_file", "raw_json", "raw_json TEXT")
+    _ensure_column(connection, "t_file", "tts_skip_reason", "tts_skip_reason TEXT")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS t_work (
@@ -86,10 +87,17 @@ def init_db(connection):
             sam_cover_url TEXT,
             thumbnail_cover_url TEXT,
             main_cover_url TEXT,
+            keep_japanese_audio INTEGER,
             raw_json TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
         """
+    )
+    _ensure_column(
+        connection,
+        "t_work",
+        "keep_japanese_audio",
+        "keep_japanese_audio INTEGER",
     )
     connection.execute(
         """
@@ -149,6 +157,10 @@ def init_db(connection):
         "CREATE INDEX IF NOT EXISTS idx_t_file_cloudflare_etag ON t_file(cloudflare_etag)"
     )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_t_file_md5 ON t_file(md5)")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_t_file_tts_skip_reason "
+        "ON t_file(tts_skip_reason)"
+    )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_t_work_title ON t_work(title)")
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_t_work_circle_name ON t_work(circle_name)"
@@ -158,6 +170,10 @@ def init_db(connection):
     )
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_t_work_create_date ON t_work(create_date)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_t_work_keep_japanese_audio "
+        "ON t_work(keep_japanese_audio)"
     )
     connection.execute("CREATE INDEX IF NOT EXISTS idx_t_va_name ON t_va(name)")
     connection.execute(

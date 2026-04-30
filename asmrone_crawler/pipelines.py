@@ -2,6 +2,7 @@ import json
 from datetime import datetime
 from uuid_extensions import uuid7
 
+from asmrone_crawler.file_rules import tts_skip_reason
 from asmrone_crawler.storage import connect, init_db
 
 
@@ -186,6 +187,11 @@ class VoiceFilesDBPipeline:
     def process_item(self, item, spider=None):
         voice_file = item
         create_pg_record = False
+        skip_reason = tts_skip_reason(
+            voice_file["path"],
+            voice_file.get("file_type"),
+            voice_file.get("duration"),
+        )
 
         try:
             existing_files = self.connection.execute(
@@ -222,9 +228,10 @@ class VoiceFilesDBPipeline:
                         media_stream_url,
                         stream_low_quality_url,
                         work_title,
-                        raw_json
+                        raw_json,
+                        tts_skip_reason
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         file_uuid,
@@ -240,6 +247,7 @@ class VoiceFilesDBPipeline:
                         voice_file.get("stream_low_quality_url"),
                         voice_file.get("work_title"),
                         _json_dumps(voice_file.get("raw_json")),
+                        skip_reason,
                     ),
                 )
             else:
@@ -254,7 +262,8 @@ class VoiceFilesDBPipeline:
                         media_stream_url = ?,
                         stream_low_quality_url = ?,
                         work_title = ?,
-                        raw_json = ?
+                        raw_json = ?,
+                        tts_skip_reason = ?
                     WHERE uuid = ?
                     """,
                     (
@@ -267,6 +276,7 @@ class VoiceFilesDBPipeline:
                         voice_file.get("stream_low_quality_url"),
                         voice_file.get("work_title"),
                         _json_dumps(voice_file.get("raw_json")),
+                        skip_reason,
                         file_uuid,
                     ),
                 )

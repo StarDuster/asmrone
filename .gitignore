@@ -5,3 +5,4 @@ __pycache__/
 .env
 error.log
 asmrone.db*
+logs/

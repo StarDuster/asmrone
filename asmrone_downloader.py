@@ -28,13 +28,17 @@ RCLONE_REMOTE_NAME = os.environ.get("RCLONE_REMOTE_NAME", "alioss")
 OSS_BUCKET_NAME = os.environ.get("OSS_BUCKET_NAME", "sd-tokyo-ap")
 OSS_PREFIX = os.environ.get("OSS_PREFIX", "datasets/speech_datasets/asmr").strip("/")
 UPLOAD_CHUNK_SIZE = 16 * 1024 * 1024  # 16 MB
+DOWNLOAD_CHUNK_SIZE = int(os.environ.get("DOWNLOAD_CHUNK_SIZE", 4 * 1024 * 1024))
+S3_UPLOAD_CONCURRENCY = int(os.environ.get("S3_UPLOAD_CONCURRENCY", 8))
+FLAC_COMPRESSION_LEVEL = os.environ.get("FLAC_COMPRESSION_LEVEL", "5")
+TQDM_MIN_INTERVAL = float(os.environ.get("TQDM_MIN_INTERVAL", "5"))
 RETRY_COUNT = 3
 DOWNLOAD_TMP_DIR = Path(
     os.environ.get("DOWNLOAD_TMP_DIR", "/data/asmrone/tmp")
 ).expanduser()
 
-NUM_WORKERS = 10
-NUM_LARGE_FILE_WORKERS = 4  # Number of workers dedicated to large files
+NUM_WORKERS = int(os.environ.get("NUM_WORKERS", 24))
+NUM_LARGE_FILE_WORKERS = int(os.environ.get("NUM_LARGE_FILE_WORKERS", 8))
 LARGE_FILE_THRESHOLD = 100 * 1024 * 1024  # 100 MB threshold for large files
 NO_EFFECT_RE = re.compile(
     r"(効果音\s*(?:なし|無し|ナシ|無|抜き)|SE\s*(?:カット|Cut|無し|なし)|効果音カット)",
@@ -54,7 +58,7 @@ logging.basicConfig(
 # Initialize constants
 transfer_config = TransferConfig(
     multipart_threshold=UPLOAD_CHUNK_SIZE,
-    max_concurrency=10,
+    max_concurrency=S3_UPLOAD_CONCURRENCY,
     multipart_chunksize=UPLOAD_CHUNK_SIZE,
     max_io_queue=100,
     io_chunksize=262144,
@@ -261,7 +265,7 @@ def _convert_wav_to_flac(input_path: Path) -> Path:
             str(input_path),
             "-vn",
             "-compression_level",
-            "8",
+            FLAC_COMPRESSION_LEVEL,
             str(output_path),
         ],
         check=True,
@@ -366,7 +370,7 @@ def download_file_and_upload_oss(file_info: FileInfo):
             with open(temp_filepath, "wb") as temp_file:
                 response = session.get(url, stream=True, timeout=30)
                 response.raise_for_status()
-                for chunk in response.iter_content(chunk_size=8192):
+                for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
                     temp_file.write(chunk)
 
             with open(temp_filepath, "rb") as f:
@@ -475,9 +479,27 @@ def main():
                 f.cloudflare_etag,
                 f.size
             FROM t_file f
-            LEFT JOIN t_work w ON w.work_id = f.work_id
-            WHERE f.masked = 0 AND f.download_date IS NULL;
+            JOIN t_work w ON w.work_id = f.work_id
+            WHERE
+                f.masked = 0
+                AND f.download_date IS NULL
+                AND w.keep_japanese_audio = 1
+                AND f.tts_skip_reason IS NULL;
         """)
+        skipped_tts_files = connection.execute(
+            """
+            SELECT f.tts_skip_reason, COUNT(*) AS file_count, SUM(f.size) AS total_size
+            FROM t_file f
+            JOIN t_work w ON w.work_id = f.work_id
+            WHERE
+                f.masked = 0
+                AND f.download_date IS NULL
+                AND w.keep_japanese_audio = 1
+                AND f.tts_skip_reason IS NOT NULL
+            GROUP BY f.tts_skip_reason
+            ORDER BY file_count DESC
+            """
+        ).fetchall()
         file_info_list, skipped_effect_files = _filter_sound_effect_variants(
             cursor.fetchall()
         )
@@ -494,6 +516,19 @@ def main():
             f"({skipped_size / 1024**4:.2f} TiB)"
         )
 
+    if skipped_tts_files:
+        skipped_tts_count = sum(row[1] for row in skipped_tts_files)
+        skipped_tts_size = sum(row[2] or 0 for row in skipped_tts_files)
+        reasons = ", ".join(
+            f"{row[0]}={row[1]}" for row in skipped_tts_files
+        )
+        print(
+            "Skipped TTS-unusable files: "
+            f"{skipped_tts_count} files "
+            f"({skipped_tts_size / 1024**4:.2f} TiB); "
+            f"{reasons}"
+        )
+
     # Create queue manager
     queue_manager = DownloadQueueManager(file_info_list)
     total_size = queue_manager.total_size
@@ -506,6 +541,7 @@ def main():
         unit_scale=True,
         unit_divisor=1024,
         smoothing=0.05,
+        mininterval=TQDM_MIN_INTERVAL,
     ) as pbar:
         threads = []
         for worker_id in range(NUM_WORKERS):

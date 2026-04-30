@@ -60,6 +60,7 @@ session.mount("https://", adapter)
 class FileInfo:
     uuid: str
     work_id: str
+    source_id: str
     file_path: str
     download_url: str
     cloudflare_etag: str
@@ -78,12 +79,12 @@ class DownloadQueueManager:
         self.small_files_queue = Queue()
         self.large_files_queue = Queue()
         self.lock = Lock()
-        self.total_size = sum(file_info[5] for file_info in file_info_list)
+        self.total_size = sum(file_info[6] for file_info in file_info_list)
 
         # Sort and split files into small and large
-        sorted_files = sorted(file_info_list, key=lambda x: x[5])
+        sorted_files = sorted(file_info_list, key=lambda x: x[6])
         for file_info in sorted_files:
-            file_size = file_info[5]
+            file_size = file_info[6]
             if file_size >= LARGE_FILE_THRESHOLD:
                 self.large_files_queue.put(FileInfo(*file_info))
             else:
@@ -187,12 +188,12 @@ def _safe_object_path(file_path: str) -> str:
     return str(PurePosixPath(*parts))
 
 
-def _object_key(work_id: str, file_path: str) -> str:
+def _object_key(source_id: str, file_path: str) -> str:
     object_path = _safe_object_path(file_path)
     if _is_wav_file(object_path):
         object_path = str(PurePosixPath(object_path).with_suffix(".flac"))
 
-    object_name = str(PurePosixPath(str(work_id), object_path))
+    object_name = str(PurePosixPath(str(source_id), object_path))
     return f"{OSS_PREFIX}/{object_name}" if OSS_PREFIX else object_name
 
 
@@ -246,20 +247,20 @@ def upload_to_bucket(file_path, object_key, expected_size):
         return False
 
 
-def copy_existing_object(source_work_id, source_path, target_work_id, target_path):
+def copy_existing_object(source_source_id, source_path, target_source_id, target_path):
     try:
         s3_client = get_s3_client()
         s3_client.copy(
             Bucket=OSS_BUCKET_NAME,
             CopySource={
                 "Bucket": OSS_BUCKET_NAME,
-                "Key": _object_key(source_work_id, source_path),
+                "Key": _object_key(source_source_id, source_path),
             },
-            Key=_object_key(target_work_id, target_path),
+            Key=_object_key(target_source_id, target_path),
         )
         return True
     except Exception as e:
-        logging.error(f"Failed to copy existing OSS object for {target_work_id}: {e}")
+        logging.error(f"Failed to copy existing OSS object for {target_source_id}: {e}")
         return False
 
 
@@ -272,11 +273,13 @@ def _try_dedup_by_hash(file_info: FileInfo):
         with database() as conn:
             cur = conn.execute(
                 """
-                SELECT work_id, path FROM t_file
-                WHERE cloudflare_etag = ?
-                    AND size = ?
-                    AND download_date IS NOT NULL
-                    AND uuid != ?
+                SELECT COALESCE(w.source_id, f.work_id), f.path
+                FROM t_file f
+                LEFT JOIN t_work w ON w.work_id = f.work_id
+                WHERE f.cloudflare_etag = ?
+                    AND f.size = ?
+                    AND f.download_date IS NOT NULL
+                    AND f.uuid != ?
                 LIMIT 1
                 """,
                 (hash_val, file_info.size, file_info.uuid),
@@ -285,7 +288,7 @@ def _try_dedup_by_hash(file_info: FileInfo):
             if not dup:
                 return False
             if not copy_existing_object(
-                dup[0], dup[1], file_info.work_id, file_info.file_path
+                dup[0], dup[1], file_info.source_id, file_info.file_path
             ):
                 return False
             conn.execute(
@@ -326,10 +329,12 @@ def download_file_and_upload_oss(file_info: FileInfo):
             with database() as connection:
                 cursor = connection.execute(
                     """
-                    SELECT work_id, path FROM t_file
-                    WHERE md5 = ?
-                        AND uuid != ?
-                        AND download_date IS NOT NULL
+                    SELECT COALESCE(w.source_id, f.work_id), f.path
+                    FROM t_file f
+                    LEFT JOIN t_work w ON w.work_id = f.work_id
+                    WHERE f.md5 = ?
+                        AND f.uuid != ?
+                        AND f.download_date IS NOT NULL
                     LIMIT 1
                     """,
                     (file_md5, uuid),
@@ -337,7 +342,7 @@ def download_file_and_upload_oss(file_info: FileInfo):
                 results = cursor.fetchall()
 
                 if len(results) > 0 and copy_existing_object(
-                    results[0][0], results[0][1], file_info.work_id, file_path
+                    results[0][0], results[0][1], file_info.source_id, file_path
                 ):
                     pass
                 else:
@@ -356,7 +361,7 @@ def download_file_and_upload_oss(file_info: FileInfo):
                     upload_size = os.path.getsize(upload_path)
                     if not upload_to_bucket(
                         str(upload_path),
-                        _object_key(file_info.work_id, file_path),
+                        _object_key(file_info.source_id, file_path),
                         upload_size,
                     ):
                         error_message = "Failed to upload to OSS."
@@ -414,9 +419,17 @@ def worker_thread(worker_id, queue_manager, pbar):
 def main():
     with database() as connection:
         cursor = connection.execute("""
-            SELECT uuid, work_id, path, download_url, cloudflare_etag, size
-            FROM t_file
-            WHERE masked = 0 AND download_date IS NULL;
+            SELECT
+                f.uuid,
+                f.work_id,
+                COALESCE(w.source_id, f.work_id) AS source_id,
+                f.path,
+                f.download_url,
+                f.cloudflare_etag,
+                f.size
+            FROM t_file f
+            LEFT JOIN t_work w ON w.work_id = f.work_id
+            WHERE f.masked = 0 AND f.download_date IS NULL;
         """)
         file_info_list = cursor.fetchall()
 

@@ -3,7 +3,9 @@ import time
 from pathlib import Path
 
 
-TMP_DIR = Path(os.environ.get("DOWNLOAD_TMP_DIR", "/data/asmrone/tmp")).expanduser()
+TMP_DIR = Path(
+    os.environ.get("DOWNLOAD_TMP_DIR", "~/.local/share/asmrone/tmp")
+).expanduser()
 MIN_AGE_HOURS = float(os.environ.get("TMP_CLEANUP_MIN_AGE_HOURS", "6"))
 
 

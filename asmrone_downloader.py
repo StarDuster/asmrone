@@ -25,8 +25,7 @@ RCLONE_CONFIG_PATH = Path(
     os.environ.get("RCLONE_CONFIG", "~/.config/rclone/rclone.conf")
 ).expanduser()
 RCLONE_REMOTE_NAME = os.environ.get("RCLONE_REMOTE_NAME", "alioss")
-OSS_BUCKET_NAME = os.environ.get("OSS_BUCKET_NAME", "sd-tokyo-ap")
-OSS_PREFIX = os.environ.get("OSS_PREFIX", "datasets/speech_datasets/asmr").strip("/")
+OSS_PREFIX = os.environ.get("OSS_PREFIX", "").strip("/")
 UPLOAD_CHUNK_SIZE = 16 * 1024 * 1024  # 16 MB
 DOWNLOAD_CHUNK_SIZE = int(os.environ.get("DOWNLOAD_CHUNK_SIZE", 4 * 1024 * 1024))
 S3_UPLOAD_CONCURRENCY = int(os.environ.get("S3_UPLOAD_CONCURRENCY", 8))
@@ -34,8 +33,19 @@ FLAC_COMPRESSION_LEVEL = os.environ.get("FLAC_COMPRESSION_LEVEL", "5")
 TQDM_MIN_INTERVAL = float(os.environ.get("TQDM_MIN_INTERVAL", "5"))
 RETRY_COUNT = 3
 DOWNLOAD_TMP_DIR = Path(
-    os.environ.get("DOWNLOAD_TMP_DIR", "/data/asmrone/tmp")
+    os.environ.get("DOWNLOAD_TMP_DIR", "~/.local/share/asmrone/tmp")
 ).expanduser()
+
+
+def get_bucket_name() -> str:
+    """Return the upload bucket. It has no default and must be set explicitly."""
+    bucket = os.environ.get("OSS_BUCKET_NAME", "").strip()
+    if not bucket:
+        raise RuntimeError(
+            "OSS_BUCKET_NAME is not set; export the bucket that receives uploads"
+        )
+    return bucket
+
 
 NUM_WORKERS = int(os.environ.get("NUM_WORKERS", 24))
 NUM_LARGE_FILE_WORKERS = int(os.environ.get("NUM_LARGE_FILE_WORKERS", 8))
@@ -276,19 +286,20 @@ def _convert_wav_to_flac(input_path: Path) -> Path:
 
 
 def upload_to_bucket(file_path, object_key, expected_size):
+    bucket = get_bucket_name()
     try:
         s3_client = get_s3_client()
         s3_client.upload_file(
-            file_path, OSS_BUCKET_NAME, object_key, Config=transfer_config
+            file_path, bucket, object_key, Config=transfer_config
         )
 
-        response = s3_client.head_object(Bucket=OSS_BUCKET_NAME, Key=object_key)
+        response = s3_client.head_object(Bucket=bucket, Key=object_key)
         uploaded_size = response["ContentLength"]
 
         if expected_size == 0 or uploaded_size == expected_size:
             return True
         else:
-            s3_client.delete_object(Bucket=OSS_BUCKET_NAME, Key=object_key)
+            s3_client.delete_object(Bucket=bucket, Key=object_key)
             error_message = "File size mismatch when uploading to OSS."
             logging.error(f"{object_key}: {error_message}\n")
             return False
@@ -299,12 +310,13 @@ def upload_to_bucket(file_path, object_key, expected_size):
 
 
 def copy_existing_object(source_source_id, source_path, target_source_id, target_path):
+    bucket = get_bucket_name()
     try:
         s3_client = get_s3_client()
         s3_client.copy(
-            Bucket=OSS_BUCKET_NAME,
+            Bucket=bucket,
             CopySource={
-                "Bucket": OSS_BUCKET_NAME,
+                "Bucket": bucket,
                 "Key": _object_key(source_source_id, source_path),
             },
             Key=_object_key(target_source_id, target_path),
